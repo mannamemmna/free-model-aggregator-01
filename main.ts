@@ -1,3 +1,4 @@
+import { ProviderHealth } from './lib/health.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { authHeaders, buildCatalog, capabilitiesOf, isRecord, joinBase, meetsRequirements, modelFree, probeProvider, ratingOfModel, readBrief, type Json, type Probe, type ProbedModel, type Requirement } from './lib/providers.ts';
 import { anthropicError, anthropicModelList, anthropicToOpenAI, openAIError, openAIModelList } from './lib/wire.ts';
@@ -10,6 +11,7 @@ const catalog = buildCatalog(environment, probes, brief.ratings);
 let requestIndex = 0;
 type Api = 'openai' | 'anthropic';
 type Route = { probe: Probe; model: ProbedModel; rating: number };
+const health = new ProviderHealth();
 
 function candidates(requirements: Requirement): Route[] {
   const result: Route[] = [];
@@ -19,7 +21,7 @@ function candidates(requirements: Requirement): Route[] {
       const rating = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, rating)) continue;
       if (!meetsRequirements(requirements, capabilitiesOf(model, rating))) continue;
-      if (requirements.json && probe.provider.wire !== 'openai') continue;
+      if (requirements.json && probe.provider.wire === 'anthropic') continue;
       result.push({ probe, model, rating: rating?.rating_milli ?? 0 });
     }
   }
@@ -106,13 +108,20 @@ async function complete(request: IncomingMessage, response: ServerResponse, api:
     for (const route of choices) {
       const provider = route.probe.provider;
       if (visited.has(provider.id)) continue;
+      // Count completed client requests, never elapsed time, so replay is stable.
+      // Cooling providers remain available after healthy alternatives are exhausted.
+      if (round === 0 && health.cooling(provider.id, requestIndex)) continue;
       visited.add(provider.id);
       try {
         const result = await upstream(route, canonical, version);
         if (!result.ok) {
+          if (result.status === 402 || result.status === 429) {
+            health.refused(provider.id, requestIndex);
+          }
           await result.arrayBuffer();
           continue;
         }
+        health.recovered(provider.id);
         const raw: unknown = await result.json();
         if (!isRecord(raw)) continue;
         const normalized = provider.wire === 'gemini' ? fromGemini(raw, route.model.id)
